@@ -13,6 +13,7 @@ import com.cleanroommc.bogosorter.client.ae2.Ae2ClientBridge;
 import com.cleanroommc.bogosorter.client.keybinds.control.BSKeybinds;
 import com.cleanroommc.bogosorter.common.HotbarSwap;
 import com.cleanroommc.bogosorter.common.OreDictHelper;
+import com.cleanroommc.bogosorter.common.PinnedSlots;
 import com.cleanroommc.bogosorter.common.SortConfigChangeEvent;
 import com.cleanroommc.bogosorter.common.XSTR;
 import com.cleanroommc.bogosorter.common.config.BogoSortCommandTree;
@@ -22,6 +23,7 @@ import com.cleanroommc.bogosorter.common.dropoff.DropOffButtonHandler;
 import com.cleanroommc.bogosorter.common.dropoff.DropOffScheduler;
 import com.cleanroommc.bogosorter.common.network.NetworkHandler;
 import com.cleanroommc.bogosorter.common.network.NetworkUtils;
+import com.cleanroommc.bogosorter.common.network.SPlayerPins;
 import com.cleanroommc.bogosorter.common.network.ae2.Ae2AmountService;
 import com.cleanroommc.bogosorter.common.network.ae2.STooltipFeatureState;
 import com.cleanroommc.bogosorter.common.refill.RefillHandler;
@@ -29,6 +31,7 @@ import com.cleanroommc.bogosorter.common.sort.ButtonHandler;
 import com.cleanroommc.bogosorter.common.sort.DefaultRules;
 import com.cleanroommc.bogosorter.compat.DefaultCompat;
 import com.cleanroommc.bogosorter.compat.Mods;
+import com.cleanroommc.bogosorter.compat.controlling.ControllingCompat;
 
 import cpw.mods.fml.client.registry.ClientRegistry;
 import cpw.mods.fml.common.FMLCommonHandler;
@@ -36,6 +39,7 @@ import cpw.mods.fml.common.Mod;
 import cpw.mods.fml.common.event.FMLPostInitializationEvent;
 import cpw.mods.fml.common.event.FMLPreInitializationEvent;
 import cpw.mods.fml.common.event.FMLServerStartingEvent;
+import cpw.mods.fml.common.event.FMLServerStoppedEvent;
 import cpw.mods.fml.common.eventhandler.SubscribeEvent;
 import cpw.mods.fml.common.gameevent.PlayerEvent;
 import cpw.mods.fml.common.network.FMLNetworkEvent;
@@ -54,20 +58,6 @@ public class BogoSorter {
 
     public static final XSTR RND = new XSTR();
     public static final Logger LOGGER = LogManager.getLogger();
-
-    private static final boolean AE2_PRESENT;
-
-    // checks if class is present to avoid NoClassDefFoundError when trying to access AE2 code on a server without AE2
-    static {
-        boolean present;
-        try {
-            Class.forName("appeng.api.storage.IStorageGrid");
-            present = true;
-        } catch (Throwable t) {
-            present = false;
-        }
-        AE2_PRESENT = present;
-    }
 
     @Mod.EventHandler
     public void onPreInit(FMLPreInitializationEvent event) {
@@ -124,6 +114,10 @@ public class BogoSorter {
             ClientRegistry.registerKeyBinding(BSKeybinds.dropoffKey);
             ClientRegistry.registerKeyBinding(BSKeybinds.ae2TerminalSearchKey);
             ClientRegistry.registerKeyBinding(BSKeybinds.BOGO_SORTER_CONTROLS_BUTTON);
+            if (Mods.Controlling.isLoaded()) {
+                ClientRegistry.registerKeyBinding(BSKeybinds.pinSlotKey);
+                ControllingCompat.setDefaultPinChord(BSKeybinds.pinSlotKey);
+            }
         }
     }
 
@@ -132,8 +126,18 @@ public class BogoSorter {
         event.registerServerCommand(new BogoSortCommandTree());
     }
 
+    @Mod.EventHandler
+    public void onServerStopped(FMLServerStoppedEvent event) {
+        Ae2AmountService.clearCaches();
+    }
+
     @SubscribeEvent
     public void onPlayerLogin(PlayerEvent.PlayerLoggedInEvent event) {
+        if (event.player instanceof EntityPlayerMP player) {
+            NetworkHandler.sendToPlayer(
+                new SPlayerPins(player.openContainer.windowId, PinnedSlots.getMask(player), new int[0]),
+                player);
+        }
         // only send tooltip state on login when ae2 is loaded
         if (Mods.Ae2.isLoaded() && event.player instanceof EntityPlayerMP) {
             NetworkHandler.sendToPlayer(
@@ -147,7 +151,7 @@ public class BogoSorter {
     @SubscribeEvent
     public void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
         // if ae2 not detected, just return
-        if (!AE2_PRESENT) return;
+        if (!Mods.Ae2.isLoaded()) return;
 
         if (event.player instanceof EntityPlayerMP) {
             Ae2AmountService.clearPlayer((EntityPlayerMP) event.player);

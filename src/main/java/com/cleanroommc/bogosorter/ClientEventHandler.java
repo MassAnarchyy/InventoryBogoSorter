@@ -3,7 +3,6 @@ package com.cleanroommc.bogosorter;
 import static com.cleanroommc.bogosorter.ShortcutHandler.SetCanTakeStack;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -19,6 +18,7 @@ import net.minecraft.inventory.Container;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.EnumChatFormatting;
 import net.minecraftforge.client.event.GuiOpenEvent;
+import net.minecraftforge.client.event.GuiScreenEvent;
 import net.minecraftforge.client.event.RenderWorldLastEvent;
 
 import org.jetbrains.annotations.Nullable;
@@ -26,21 +26,27 @@ import org.lwjgl.input.Keyboard;
 import org.lwjgl.input.Mouse;
 
 import com.cleanroommc.bogosorter.api.SortRule;
+import com.cleanroommc.bogosorter.client.PinnedSlotClient;
+import com.cleanroommc.bogosorter.client.drop.DropKeyRepeatHandler;
 import com.cleanroommc.bogosorter.client.keybinds.KeyBind;
 import com.cleanroommc.bogosorter.client.keybinds.control.BSKeybinds;
 import com.cleanroommc.bogosorter.client.network.ClientNetworkHandler;
+import com.cleanroommc.bogosorter.common.PinnedSlots;
 import com.cleanroommc.bogosorter.common.config.BogoSorterConfig;
 import com.cleanroommc.bogosorter.common.config.ConfigGui;
 import com.cleanroommc.bogosorter.common.config.SortRulesConfig;
 import com.cleanroommc.bogosorter.common.dropoff.render.RendererCube;
 import com.cleanroommc.bogosorter.common.network.CDropOff;
+import com.cleanroommc.bogosorter.common.network.CPlayerPins;
 import com.cleanroommc.bogosorter.common.network.CSort;
 import com.cleanroommc.bogosorter.common.network.NetworkHandler;
 import com.cleanroommc.bogosorter.common.sort.ClientSortData;
 import com.cleanroommc.bogosorter.common.sort.GuiSortingContext;
 import com.cleanroommc.bogosorter.common.sort.SlotGroup;
 import com.cleanroommc.bogosorter.common.sort.SortHandler;
+import com.cleanroommc.bogosorter.compat.Mods;
 import com.cleanroommc.bogosorter.compat.ae2.Ae2TerminalSearchAdapter;
+import com.cleanroommc.bogosorter.compat.controlling.ControllingCompat;
 import com.cleanroommc.bogosorter.compat.screen.WarningScreen;
 import com.cleanroommc.bogosorter.mixins.early.minecraft.SlotAccessor;
 import com.cleanroommc.modularui.api.event.KeyboardInputEvent;
@@ -64,22 +70,20 @@ public class ClientEventHandler {
     private static long timeDropoff = 0;
     private static long ticks = 0;
     private static GuiScreen nextGui = null;
+    private static boolean pinSyncPending;
 
     private static Class<?> NEI_GUI_RECIPE_CLASS;
-    private static Field NEI_SEARCH_FIELD;
-    private static Method NEI_SEARCH_FIELD_IS_VISIBLE;
-    private static Method NEI_SEARCH_FIELD_FOCUSED;
+    private static Field NEI_RECIPE_SEARCH_FIELD;
+    private static Field NEI_INVENTORY_SEARCH_FIELD;
 
     static {
         try {
             if (Loader.isModLoaded("NotEnoughItems")) {
                 NEI_GUI_RECIPE_CLASS = Class.forName("codechicken.nei.recipe.GuiRecipe");
-                NEI_SEARCH_FIELD = NEI_GUI_RECIPE_CLASS.getDeclaredField("searchField");
-                NEI_SEARCH_FIELD.setAccessible(true);
-                NEI_SEARCH_FIELD_IS_VISIBLE = NEI_SEARCH_FIELD.getType()
-                    .getMethod("isVisible");
-                NEI_SEARCH_FIELD_FOCUSED = NEI_SEARCH_FIELD.getType()
-                    .getMethod("focused");
+                NEI_RECIPE_SEARCH_FIELD = NEI_GUI_RECIPE_CLASS.getDeclaredField("searchField");
+                NEI_RECIPE_SEARCH_FIELD.setAccessible(true);
+                NEI_INVENTORY_SEARCH_FIELD = Class.forName("codechicken.nei.LayoutManager")
+                    .getField("searchField");
             }
         } catch (ReflectiveOperationException | LinkageError e) {
             NEI_GUI_RECIPE_CLASS = null;
@@ -99,6 +103,13 @@ public class ClientEventHandler {
         if (event.phase == TickEvent.Phase.END) {
             ClientNetworkHandler.drainClientTasks();
             Ae2TerminalSearchAdapter.applyPendingSearch();
+            DropKeyRepeatHandler.onClientTick();
+            if (pinSyncPending) {
+                if (Minecraft.getMinecraft().currentScreen instanceof GuiContainer gui) {
+                    NetworkHandler.sendToServer(CPlayerPins.get(gui.inventorySlots.windowId));
+                }
+                pinSyncPending = false;
+            }
         }
         if (event.phase == TickEvent.Phase.START) {
             ticks++;
@@ -113,10 +124,13 @@ public class ClientEventHandler {
     public void onClientDisconnect(FMLNetworkEvent.ClientDisconnectionFromServerEvent ignored) {
         Ae2TerminalSearchAdapter.clearPendingSearch();
         com.cleanroommc.bogosorter.client.ae2.Ae2ClientBridge.resetConnectionState();
+        PinnedSlotClient.clear();
     }
 
     @SubscribeEvent(priority = EventPriority.LOWEST)
     public void onGuiOpen(GuiOpenEvent event) {
+        PinnedSlotClient.clearContainer();
+        pinSyncPending = false;
         if (event.gui instanceof GuiMainMenu && !WarningScreen.wasOpened) {
             WarningScreen.wasOpened = true;
             List<String> warnings = new ArrayList<>();
@@ -132,6 +146,13 @@ public class ClientEventHandler {
         }
     }
 
+    @SubscribeEvent
+    public void onInitGui(GuiScreenEvent.InitGuiEvent.Post event) {
+        if (event.gui instanceof GuiContainer) {
+            pinSyncPending = true;
+        }
+    }
+
     private static void shortcutAction() {
         timeShortcut = Minecraft.getSystemTime();
     }
@@ -140,16 +161,16 @@ public class ClientEventHandler {
         return Minecraft.getSystemTime() - timeShortcut > 50;
     }
 
-    // i have to subscribe to 4 events to catch all inputs
+    // Subscribe to 4 events to catch all inputs
 
     @SubscribeEvent
     public void onKeyInput(InputEvent.KeyInputEvent event) {
-        handleInput(null);
+        handleInput(null, false);
     }
 
     @SubscribeEvent
     public void onKeyInput(InputEvent.MouseInputEvent event) {
-        handleInput(null);
+        handleInput(null, true);
     }
 
     @SubscribeEvent(priority = EventPriority.LOW)
@@ -160,7 +181,7 @@ public class ClientEventHandler {
             event.setCanceled(true);
             return;
         }
-        if (handleInput((GuiContainer) event.gui)) {
+        if (handleInput((GuiContainer) event.gui, false)) {
             event.setCanceled(true);
             return;
         }
@@ -189,7 +210,7 @@ public class ClientEventHandler {
     @SubscribeEvent(priority = EventPriority.LOW)
     public void onMouseInput(MouseInputEvent.Pre event) {
         KeyBind.checkKeys(getTicks());
-        if (event.gui instanceof GuiContainer && handleInput((GuiContainer) event.gui)) {
+        if (event.gui instanceof GuiContainer && handleInput((GuiContainer) event.gui, true)) {
             event.setCanceled(true);
         }
     }
@@ -202,7 +223,17 @@ public class ClientEventHandler {
     }
 
     // handle all inputs in one method
-    public static boolean handleInput(@Nullable GuiContainer container) {
+    public static boolean handleInput(@Nullable GuiContainer container, boolean fromMouse) {
+
+        if (container != null && pinSlotPressed(fromMouse)) {
+            SlotAccessor slot = getSlot(container);
+            if (PinnedSlots.isPinnable(Minecraft.getMinecraft().thePlayer, container.inventorySlots, slot)) {
+                PinnedSlotClient.toggle(container, slot);
+                NetworkHandler
+                    .sendToServer(CPlayerPins.toggle(container.inventorySlots.windowId, slot.getSlotNumber()));
+                return true;
+            }
+        }
 
         if (container != null && canDoShortcutAction()) {
             KeyBind key;
@@ -244,7 +275,8 @@ public class ClientEventHandler {
             }
             SetCanTakeStack = true;
         }
-        if (Keypress(BSKeybinds.sortKeyOutsideGUI)) {
+        if (Keypress(BSKeybinds.sortKeyOutsideGUI)
+            && (Minecraft.getMinecraft().currentScreen == null || container != null)) {
             long t = Minecraft.getSystemTime();
             if (t - timeSort > 500) {
                 sort(Minecraft.getMinecraft().thePlayer.inventoryContainer, null, 9); // main inventory
@@ -276,8 +308,9 @@ public class ClientEventHandler {
                 timeConfigGui = t;
             }
         }
-        // keybind press + filter out nei
-        if (Keypress(BSKeybinds.dropoffKey) && !isNeiRecipeSearchFocused()) {
+        // Ignore the global input event while a GUI is open; GUI input is handled above with its actual context.
+        if (Keypress(BSKeybinds.dropoffKey) && (Minecraft.getMinecraft().currentScreen == null || container != null)
+            && !isNeiSearchFocused()) {
             long t = Minecraft.getSystemTime();
             if (t - timeDropoff > BogoSorterConfig.dropOff.dropoffPacketThrottleInMS) {
                 if (BogoSorterConfig.dropOff.enableDropOff) {
@@ -289,38 +322,49 @@ public class ClientEventHandler {
         return false;
     }
 
-    // check if nei filter search bar is active
-    private static boolean isNeiRecipeSearchFocused() {
+    private static boolean pinSlotPressed(boolean fromMouse) {
+        if (Mods.Controlling.isLoaded()) {
+            KeyBinding key = BSKeybinds.pinSlotKey;
+            int keyCode = key.getKeyCode();
+            boolean pressed = keyCode > 0
+                ? !fromMouse && Keyboard.getEventKeyState() && Keyboard.getEventKey() == keyCode
+                : fromMouse && Mouse.getEventButtonState() && Mouse.getEventButton() == keyCode + 100;
+            return keyCode != 0 && pressed && ControllingCompat.isModifierActive(key);
+        }
+        KeyBind key = BSKeybinds.getActiveKeyBind(BSKeybinds.PIN_SLOT);
+        return key != null && key.isFirstPress();
+    }
+
+    private static boolean isNeiSearchFocused() {
         if (NEI_GUI_RECIPE_CLASS == null) return false;
 
         try {
+            Object searchField = NEI_INVENTORY_SEARCH_FIELD.get(null);
+            if (isNeiSearchFocused(searchField)) return true;
+
             GuiScreen currentScreen = Minecraft.getMinecraft().currentScreen;
             if (!NEI_GUI_RECIPE_CLASS.isInstance(currentScreen)) return false;
-            Object searchField = NEI_SEARCH_FIELD.get(null);
-            return searchField != null && Boolean.TRUE.equals(NEI_SEARCH_FIELD_IS_VISIBLE.invoke(searchField))
-                && Boolean.TRUE.equals(NEI_SEARCH_FIELD_FOCUSED.invoke(searchField));
+            return isNeiSearchFocused(NEI_RECIPE_SEARCH_FIELD.get(null));
         } catch (ReflectiveOperationException | LinkageError ignored) {
             return false;
         }
+    }
+
+    private static boolean isNeiSearchFocused(@Nullable Object searchField) throws ReflectiveOperationException {
+        return searchField != null && Boolean.TRUE.equals(
+            searchField.getClass()
+                .getMethod("isVisible")
+                .invoke(searchField))
+            && Boolean.TRUE.equals(
+                searchField.getClass()
+                    .getMethod("focused")
+                    .invoke(searchField));
     }
 
     private static boolean canSort(@Nullable SlotAccessor slot) {
         return !Minecraft.getMinecraft().thePlayer.capabilities.isCreativeMode
             || (Minecraft.getMinecraft().thePlayer.inventory.getItemStack() == null
                 && (slot == null || slot.callGetStack() == null));
-    }
-
-    private static boolean isButtonPressed(int button) {
-        return Mouse.getEventButtonState() && Mouse.getEventButton() == button;
-    }
-
-    private static boolean isKeyDown(KeyBinding key) {
-        if (key.getKeyCode() == 0) return false;
-
-        if (key.getKeyCode() < 0) {
-            return isButtonPressed(key.getKeyCode() + 100);
-        }
-        return Keyboard.getEventKeyState() && Keyboard.getEventKey() == key.getKeyCode();
     }
 
     public static boolean isSortableContainer(GuiScreen screen) {
@@ -410,10 +454,12 @@ public class ClientEventHandler {
     private static boolean Keypress(KeyBinding key) {
         int keyCode = key.getKeyCode();
         if (keyCode == 0) return false;
-        if (keyCode > 0) {
-            return key.isPressed() || Keyboard.isKeyDown(keyCode);
-        } else {
-            return Mouse.isButtonDown(100 + keyCode);
-        }
+        if (key.isPressed() || key.getIsKeyPressed()) return true;
+
+        boolean eventPressed = keyCode > 0 ? Keyboard.getEventKeyState() && Keyboard.getEventKey() == keyCode
+            : Mouse.getEventButtonState() && Mouse.getEventButton() == keyCode + 100;
+        if (!eventPressed) return false;
+
+        return !Mods.Controlling.isLoaded() || ControllingCompat.isModifierActive(key);
     }
 }
